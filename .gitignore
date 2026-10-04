@@ -7,3 +7,7 @@ __pycache__/
 dist/
 build/
 *.egg-info/
+gateway-state.db*
+*.db
+*.db-wal
+*.db-shm

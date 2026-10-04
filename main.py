@@ -48,6 +48,10 @@ def build_config() -> GatewayConfig:
             multiplier=2.0,
         ),
         default_quota=default_quota,
+        storage_path=os.environ.get("GATEWAY_STORAGE_PATH", "gateway-state.db"),
+        retention_seconds=_env_float("GATEWAY_RETENTION_SECONDS", 3600.0),
+        reaper_interval=_env_float("GATEWAY_REAPER_INTERVAL", 60.0),
+        tombstone_retention=_env_float("GATEWAY_TOMBSTONE_RETENTION", 604800.0),
     )
 
 

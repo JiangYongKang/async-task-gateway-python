@@ -34,6 +34,11 @@ def make_executor():
         idempotency_ttl: float = 300.0,
         shutdown_grace: float = 5.0,
         quotas: dict[str, QuotaConfig] | None = None,
+        storage_path: str | None = None,
+        retention_seconds: float = 3600.0,
+        reaper_interval: float = 60.0,
+        tombstone_retention: float = 604800.0,
+        registry=None,
     ) -> TaskExecutor:
         cfg = GatewayConfig(
             idempotency_ttl=idempotency_ttl,
@@ -50,12 +55,16 @@ def make_executor():
                 queue_capacity=queue_capacity,
             ),
             quotas=quotas or {},
+            storage_path=storage_path,
+            retention_seconds=retention_seconds,
+            reaper_interval=reaper_interval,
+            tombstone_retention=tombstone_retention,
         )
         executor = TaskExecutor(
             config=cfg,
             quota_manager=QuotaManager(cfg.default_quota, cfg.quotas),
             idempotency_store=IdempotencyStore(idempotency_ttl),
-            registry=build_default_registry(),
+            registry=registry or build_default_registry(),
         )
         started.append(executor)
         return executor

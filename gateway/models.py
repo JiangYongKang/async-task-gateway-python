@@ -80,12 +80,25 @@ class GatewayConfig:
     default_retry: RetryPolicy = field(default_factory=RetryPolicy)
     quotas: dict[str, QuotaConfig] = field(default_factory=dict)
     default_quota: QuotaConfig = field(default_factory=QuotaConfig)
+    # Durability / history retention (all optional; defaults keep the
+    # previous in-memory-only behaviour except that retention still bounds
+    # how long terminal records are kept).
+    storage_path: str | None = None  # None -> ephemeral, nothing persisted
+    retention_seconds: float = 3600.0  # terminal tasks older than this are reclaimed
+    reaper_interval: float = 60.0  # background reclaim pass interval
+    tombstone_retention: float = 604800.0  # how long reclaimed-task tombstones live
 
     def __post_init__(self) -> None:
         if self.idempotency_ttl <= 0:
             raise ValueError("idempotency_ttl must be > 0")
         if self.shutdown_grace < 0:
             raise ValueError("shutdown_grace must be >= 0")
+        if self.retention_seconds <= 0:
+            raise ValueError("retention_seconds must be > 0")
+        if self.reaper_interval <= 0:
+            raise ValueError("reaper_interval must be > 0")
+        if self.tombstone_retention < 0:
+            raise ValueError("tombstone_retention must be >= 0")
 
     def retry_for(self, task_type: str) -> RetryPolicy:
         """Retry policies may later be keyed by task type; default for now."""
@@ -157,3 +170,26 @@ class TaskRecord:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
+
+
+@dataclass(frozen=True)
+class Tombstone:
+    """Proof that a reclaimed task existed, kept for a bounded time.
+
+    A lookup hitting a tombstone answers TASK_RECLAIMED (with the final
+    state) instead of TASK_NOT_FOUND, so callers can tell "archived after
+    retention" apart from "never existed". Tombstones themselves expire
+    (``expires_at``) and are then dropped for good.
+    """
+
+    task_id: str
+    caller: str
+    task_type: str
+    final_state: TaskState
+    attempt: int
+    error_code: str | None
+    error_message: str | None
+    created_at: float
+    finished_at: float   # last updated_at of the terminal record
+    reclaimed_at: float
+    expires_at: float    # tombstone expiry (reclaimed_at + tombstone_retention)

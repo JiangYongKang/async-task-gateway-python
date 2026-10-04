@@ -54,13 +54,19 @@ class IllegalTransition(Exception):
 
 
 # Legal forward transitions for the task state machine.
+# SCHEDULED -> PENDING exists solely for restart recovery: a task that was
+# dequeued but never ran is re-queued exactly once during recovery.
 LEGAL_TRANSITIONS: dict[TaskState, frozenset[TaskState]] = {
     TaskState.PENDING: frozenset({TaskState.SCHEDULED, TaskState.CANCELLED}),
-    TaskState.SCHEDULED: frozenset({TaskState.RUNNING, TaskState.CANCELLED}),
+    TaskState.SCHEDULED: frozenset(
+        {TaskState.RUNNING, TaskState.CANCELLED, TaskState.PENDING}
+    ),
     TaskState.RUNNING: frozenset(
         {TaskState.SUCCEEDED, TaskState.FAILED, TaskState.RETRY_WAIT, TaskState.CANCELLED}
     ),
-    TaskState.RETRY_WAIT: frozenset({TaskState.RUNNING, TaskState.CANCELLED}),
+    TaskState.RETRY_WAIT: frozenset(
+        {TaskState.RUNNING, TaskState.CANCELLED, TaskState.FAILED}
+    ),
     TaskState.SUCCEEDED: frozenset(),
     TaskState.FAILED: frozenset(),
     TaskState.CANCELLED: frozenset(),
