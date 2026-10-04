@@ -80,12 +80,28 @@ class GatewayConfig:
     default_retry: RetryPolicy = field(default_factory=RetryPolicy)
     quotas: dict[str, QuotaConfig] = field(default_factory=dict)
     default_quota: QuotaConfig = field(default_factory=QuotaConfig)
+    # Durable journal path; None keeps the original in-memory-only mode.
+    persistence_path: str | None = None
+    # Seconds a terminal task stays queryable before the sweeper reclaims
+    # it; 0 disables history reclamation entirely.
+    history_retention: float = 3600.0
+    # How often the retention sweeper runs.
+    retention_sweep_interval: float = 60.0
+    # Seconds a reclaimed task's tombstone is kept so lookups can still be
+    # answered with TASK_EXPIRED instead of TASK_NOT_FOUND.
+    tombstone_retention: float = 86400.0
 
     def __post_init__(self) -> None:
         if self.idempotency_ttl <= 0:
             raise ValueError("idempotency_ttl must be > 0")
         if self.shutdown_grace < 0:
             raise ValueError("shutdown_grace must be >= 0")
+        if self.history_retention < 0:
+            raise ValueError("history_retention must be >= 0")
+        if self.retention_sweep_interval <= 0:
+            raise ValueError("retention_sweep_interval must be > 0")
+        if self.tombstone_retention < 0:
+            raise ValueError("tombstone_retention must be >= 0")
 
     def retry_for(self, task_type: str) -> RetryPolicy:
         """Retry policies may later be keyed by task type; default for now."""

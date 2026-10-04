@@ -48,16 +48,26 @@ def build_config() -> GatewayConfig:
             multiplier=2.0,
         ),
         default_quota=default_quota,
+        persistence_path=os.environ.get("GATEWAY_PERSISTENCE_PATH") or None,
+        history_retention=_env_float("GATEWAY_HISTORY_RETENTION", 3600.0),
+        retention_sweep_interval=_env_float("GATEWAY_RETENTION_SWEEP_INTERVAL", 60.0),
+        tombstone_retention=_env_float("GATEWAY_TOMBSTONE_RETENTION", 86400.0),
     )
 
 
 def build_executor(config: GatewayConfig | None = None) -> TaskExecutor:
     config = config or build_config()
+    persistence = None
+    if config.persistence_path is not None:
+        from gateway.persistence import SqlitePersistence
+        persistence = SqlitePersistence(config.persistence_path)
     return TaskExecutor(
         config=config,
         quota_manager=QuotaManager(config.default_quota, config.quotas),
-        idempotency_store=IdempotencyStore(config.idempotency_ttl),
+        idempotency_store=IdempotencyStore(config.idempotency_ttl,
+                                           persistence=persistence),
         registry=build_default_registry(),
+        persistence=persistence,
     )
 
 

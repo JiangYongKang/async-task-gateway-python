@@ -15,11 +15,14 @@ in a real deployment this would be a Redis SETNX-style record.
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from dataclasses import dataclass
 from typing import Any, Callable
 
 from gateway.errors import ErrorCode, GatewayError
+
+logger = logging.getLogger("gateway.idempotency")
 
 
 class IdempotencyConflict(GatewayError):
@@ -46,11 +49,36 @@ class LookupResult:
 
 
 class IdempotencyStore:
-    def __init__(self, ttl: float, *, clock: Callable[[], float] = time.time):
+    def __init__(
+        self,
+        ttl: float,
+        *,
+        clock: Callable[[], float] = time.time,
+        persistence: Any = None,
+    ):
         self._ttl = ttl
         self._clock = clock
         self._entries: dict[str, IdempotencyEntry] = {}
         self._lock = asyncio.Lock()
+        # Optional write-through journal (gateway.persistence backend);
+        # None keeps the original in-memory-only behaviour.
+        self._persistence = persistence
+
+    async def load(self) -> int:
+        """Restore persisted bindings (called once at executor startup)."""
+        if self._persistence is None:
+            return 0
+        entries = await self._persistence.load_idempotency()
+        async with self._lock:
+            now = self._clock()
+            live = {k: e for k, e in entries.items() if e.expires_at > now}
+            expired = len(entries) - len(live)
+            self._entries.update(live)
+        logger.info(
+            "idempotency bindings restored: live=%s expired_dropped=%s ttl=%ss",
+            len(live), expired, self._ttl,
+        )
+        return len(live)
 
     async def lookup(self, key: str) -> LookupResult | None:
         """Return the live entry for ``key``, an expired one, or ``None``."""
@@ -63,6 +91,7 @@ class IdempotencyStore:
                 return LookupResult(entry=entry, reused=True)
             # Expired: drop it and report so the caller can rebind the key.
             del self._entries[key]
+            await self._persist_delete(key)
             return LookupResult(entry=entry, reused=False)
 
     async def reserve(self, key: str, task_id: str, request_hash: str) -> None:
@@ -81,6 +110,7 @@ class IdempotencyStore:
             self._entries[key] = IdempotencyEntry(
                 task_id=task_id, request_hash=request_hash, expires_at=now + self._ttl
             )
+            await self._persist_save(key, self._entries[key])
 
 
     async def release(self, key: str, task_id: str) -> None:
@@ -89,6 +119,7 @@ class IdempotencyStore:
             entry = self._entries.get(key)
             if entry is not None and entry.task_id == task_id:
                 del self._entries[key]
+                await self._persist_delete(key)
 
     async def purge_expired(self) -> int:
         async with self._lock:
@@ -96,8 +127,18 @@ class IdempotencyStore:
             dead = [k for k, e in self._entries.items() if e.expires_at <= now]
             for k in dead:
                 del self._entries[k]
+                await self._persist_delete(k)
             return len(dead)
 
     async def size(self) -> int:
         async with self._lock:
             return len(self._entries)
+
+    # ------------------------------------------------------------------
+    async def _persist_save(self, key: str, entry: IdempotencyEntry) -> None:
+        if self._persistence is not None:
+            await self._persistence.save_idempotency(key, entry)
+
+    async def _persist_delete(self, key: str) -> None:
+        if self._persistence is not None:
+            await self._persistence.delete_idempotency(key)

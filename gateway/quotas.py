@@ -68,7 +68,11 @@ class CallerQuota:
         self._running = 0
         self._admit_cap = config.max_concurrency + config.queue_capacity
         self._slots = asyncio.Semaphore(config.max_concurrency)
-        self._queue: asyncio.Queue[str] = asyncio.Queue(maxsize=self._admit_cap)
+        # The queue itself is unbounded: admission is enforced solely by the
+        # ``_inflight >= _admit_cap`` check in ``enqueue`` so that restart
+        # recovery can re-admit previously admitted tasks via ``restore``
+        # even if the configured capacity shrank in between.
+        self._queue: asyncio.Queue[str] = asyncio.Queue()
         self._lock = asyncio.Lock()
 
     # ----- stats -----------------------------------------------------------
@@ -116,6 +120,17 @@ class CallerQuota:
 
     async def next_task(self) -> str:
         return await self._queue.get()
+
+    async def restore(self, task_id: str) -> None:
+        """Re-admit a previously admitted task after a restart.
+
+        Bypasses the capacity check on purpose: the task was already
+        admitted before the restart, so refusing it now would strand work
+        that callers were told was accepted.
+        """
+        async with self._lock:
+            self._inflight += 1
+            self._queue.put_nowait(task_id)
 
     def task_done(self) -> None:
         self._queue.task_done()

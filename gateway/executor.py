@@ -50,6 +50,17 @@ class TaskNotFound(GatewayError):
         super().__init__(ErrorCode.TASK_NOT_FOUND, f"task {task_id!r} not found")
 
 
+class TaskExpired(GatewayError):
+    """The task existed but its terminal record was reclaimed by retention."""
+
+    def __init__(self, task_id: str):
+        super().__init__(
+            ErrorCode.TASK_EXPIRED,
+            f"task {task_id!r} existed but its history was reclaimed after "
+            "the retention period elapsed",
+        )
+
+
 class TaskNotCancellable(GatewayError):
     def __init__(self, task_id: str, state: TaskState):
         super().__init__(
@@ -74,6 +85,7 @@ class TaskExecutor:
         idempotency_store: IdempotencyStore,
         registry: HandlerRegistry,
         *,
+        persistence: Any = None,
         clock: Callable[[], float] | None = None,
     ):
         self._config = config
@@ -81,17 +93,96 @@ class TaskExecutor:
         self._idem = idempotency_store
         self._registry = registry
         self._clock = clock or time.time
+        from gateway.persistence import NullPersistence
+        self._persistence = persistence if persistence is not None else NullPersistence()
         self._lock = asyncio.Lock()
         self._terminal_cv = asyncio.Condition(self._lock)
         self._tasks: dict[str, TaskRecord] = {}
         self._workers: dict[str, asyncio.Task] = {}
         self._handler_tasks: dict[str, asyncio.Task] = {}
         self._shutting_down = asyncio.Event()
+        # Reclaimed terminal tasks: task_id -> reclamation timestamp.  Kept
+        # (and persisted) for ``tombstone_retention`` seconds so lookups of
+        # reclaimed tasks answer TASK_EXPIRED instead of TASK_NOT_FOUND.
+        self._tombstones: dict[str, float] = {}
+        self._sweeper: asyncio.Task | None = None
+        # Test-only crash simulation: once set, no further state mutations
+        # are persisted, mirroring what a real process crash would leave
+        # behind in the durable journal.
+        self._crashed = False
 
     # ------------------------------------------------------------------
     async def start(self) -> None:
         logger.info("executor started: idempotency_ttl=%ss grace=%ss",
                     self._config.idempotency_ttl, self._config.shutdown_grace)
+        await self._idem.load()
+        self._tombstones.update(await self._persistence.load_tombstones())
+        await self._recover()
+        if self._config.history_retention > 0:
+            self._sweeper = asyncio.create_task(
+                self._sweep_loop(), name="retention-sweeper")
+            logger.info("retention sweeper started: retention=%ss interval=%ss "
+                        "tombstone_retention=%ss",
+                        self._config.history_retention,
+                        self._config.retention_sweep_interval,
+                        self._config.tombstone_retention)
+
+    async def _recover(self) -> None:
+        """Reload persisted tasks and re-drive the non-terminal ones.
+
+        Terminal records are restored verbatim (a task that succeeded before
+        the restart is never executed again).  Non-terminal records are
+        re-admitted into the caller's queue as PENDING:
+
+        * PENDING     - still waiting; re-queued as-is.
+        * SCHEDULED   - was waiting for a slot; re-queued.
+        * RUNNING     - the in-flight attempt was interrupted by the
+                        restart; it is re-driven at the *same* attempt
+                        number (the interrupted attempt never committed a
+                        result).  This is logged loudly because handler
+                        side effects of the interrupted attempt may be
+                        duplicated (at-least-once semantics).
+        * RETRY_WAIT  - the failed attempt is final; the *next* attempt is
+                        scheduled (attempt += 1) and the task re-queued.
+        """
+        records = await self._persistence.load_tasks()
+        if not records:
+            return
+        async with self._lock:
+            for record in records:
+                record.cancel_event = asyncio.Event()
+                self._tasks[record.task_id] = record
+            todo = [r for r in records if not r.state.is_terminal]
+            for record in todo:
+                if record.state is TaskState.RETRY_WAIT:
+                    record.attempt += 1
+                    record.transition_to(TaskState.RUNNING)  # legal: RETRY_WAIT->RUNNING
+                    logger.warning(
+                        "recovery: task=%s was in RETRY_WAIT; scheduling attempt=%s",
+                        record.task_id, record.attempt)
+                if record.state is TaskState.RUNNING:
+                    logger.warning(
+                        "recovery: task=%s attempt=%s was interrupted by the restart; "
+                        "re-driving that attempt (side effects may be duplicated)",
+                        record.task_id, record.attempt)
+                if record.state is not TaskState.PENDING:
+                    logger.info("recovery: task=%s state=%s -> PENDING (re-queued)",
+                                record.task_id, record.state.value)
+                    record.state = TaskState.PENDING
+                    record.updated_at = self._clock()
+                quota = self._quotas.get(record.caller)
+                await quota.restore(record.task_id)
+                self._ensure_worker_locked(record.caller)
+                await self._persist_locked(record)
+        terminal = sum(1 for r in records if r.state.is_terminal)
+        logger.info("recovery complete: restored=%s terminal=%s requeued=%s",
+                    len(records), terminal, len(todo))
+
+    async def _persist_locked(self, task: TaskRecord) -> None:
+        """Write-through the committed state of a task (caller holds lock)."""
+        if self._crashed:
+            return
+        await self._persistence.save_task(task)
 
     @property
     def is_shutting_down(self) -> bool:
@@ -122,17 +213,26 @@ class TaskExecutor:
             if idempotency_key is not None:
                 lookup = await self._idem.lookup(idempotency_key)
                 if lookup is not None and lookup.reused:
-                    existing = self._tasks[lookup.entry.task_id]
-                    if lookup.entry.request_hash != request_hash:
+                    existing = self._tasks.get(lookup.entry.task_id)
+                    if existing is None:
+                        # Defensive: the sweeper never reclaims a task whose
+                        # idempotency window is live, so this should not
+                        # happen; if it does, rebind rather than crash.
+                        logger.warning(
+                            "idempotency entry without task record: key=%s task=%s; "
+                            "rebinding key", idempotency_key, lookup.entry.task_id)
+                        await self._idem.release(idempotency_key, lookup.entry.task_id)
+                    elif lookup.entry.request_hash != request_hash:
                         logger.warning(
                             "idempotency conflict: key=%s existing_task=%s "
                             "bound_hash=%s incoming_hash=%s",
                             idempotency_key, existing.task_id,
                             lookup.entry.request_hash[:12], request_hash[:12])
                         raise IdempotencyConflict(idempotency_key, existing.task_id)
-                    logger.info("idempotent reuse: key=%s -> task=%s state=%s",
-                                idempotency_key, existing.task_id, existing.state.value)
-                    return SubmitResult(task=existing, reused=True)
+                    else:
+                        logger.info("idempotent reuse: key=%s -> task=%s state=%s",
+                                    idempotency_key, existing.task_id, existing.state.value)
+                        return SubmitResult(task=existing, reused=True)
 
             # 2) Submit rate limit (only charged for genuinely new intent).
             quota = self._quotas.get(caller)
@@ -173,6 +273,7 @@ class TaskExecutor:
                 raise
 
             self._tasks[task.task_id] = task
+            await self._persist_locked(task)
             self._ensure_worker_locked(caller)
             logger.info("task accepted: task=%s caller=%s state=PENDING inflight=%s queued=%s",
                         task.task_id, caller, quota.inflight, quota.queued)
@@ -185,6 +286,10 @@ class TaskExecutor:
         async with self._lock:
             task = self._tasks.get(task_id)
             if task is None:
+                if task_id in self._tombstones:
+                    logger.info("get_task: task=%s found only as tombstone -> TASK_EXPIRED",
+                                task_id)
+                    raise TaskExpired(task_id)
                 raise TaskNotFound(task_id)
             return task
 
@@ -210,6 +315,8 @@ class TaskExecutor:
 
     async def wait_terminal(self, task_id: str, timeout: float | None = None) -> TaskRecord:
         async with self._terminal_cv:
+            if task_id not in self._tasks and task_id in self._tombstones:
+                raise TaskExpired(task_id)
             await asyncio.wait_for(
                 self._terminal_cv.wait_for(
                     lambda: task_id in self._tasks and self._tasks[task_id].state.is_terminal
@@ -224,6 +331,70 @@ class TaskExecutor:
             "terminal": sum(1 for t in self._tasks.values() if t.state.is_terminal),
             "shutting_down": self._shutting_down.is_set(),
         }
+
+    # ------------------------------------------------------------------
+    # History retention
+    # ------------------------------------------------------------------
+    async def _sweep_loop(self) -> None:
+        try:
+            while True:
+                await asyncio.sleep(self._config.retention_sweep_interval)
+                await self.sweep_now()
+        except asyncio.CancelledError:
+            pass
+
+    async def sweep_now(self) -> int:
+        """Reclaim terminal tasks older than ``history_retention``.
+
+        A task is reclaimed only when *both* hold:
+        * it is in a terminal state (never touch in-flight work), and
+        * it has no idempotency binding still inside its validity window
+          (reclaiming those would break reuse-after-restart semantics).
+
+        Reclaimed tasks leave a tombstone so later lookups answer
+        TASK_EXPIRED (distinguishable from TASK_NOT_FOUND).  Tombstones
+        themselves expire after ``tombstone_retention`` seconds.  All
+        mutations happen under the executor lock, so sweeping never races
+        submission, execution or queries into an inconsistent state.
+        """
+        await self._idem.purge_expired()
+        now = self._clock()
+        reclaimed = 0
+        async with self._lock:
+            for task in list(self._tasks.values()):
+                if not task.state.is_terminal:
+                    continue
+                age = now - task.updated_at
+                if age < self._config.history_retention:
+                    continue
+                if task.idempotency_key is not None:
+                    lookup = await self._idem.lookup(task.idempotency_key)
+                    if lookup is not None and lookup.reused:
+                        logger.info(
+                            "sweep skipped (idempotency window live): task=%s key=%s "
+                            "age=%.1fs", task.task_id, task.idempotency_key, age)
+                        continue
+                del self._tasks[task.task_id]
+                self._tombstones[task.task_id] = now
+                await self._persistence.delete_task(task.task_id)
+                await self._persistence.save_tombstone(task.task_id, now)
+                reclaimed += 1
+                logger.info("task reclaimed: task=%s state=%s age=%.1fs retention=%ss",
+                            task.task_id, task.state.value, age,
+                            self._config.history_retention)
+            dead_tombstones = [
+                tid for tid, expired_at in self._tombstones.items()
+                if now - expired_at >= self._config.tombstone_retention
+            ]
+            for tid in dead_tombstones:
+                del self._tombstones[tid]
+                await self._persistence.delete_tombstone(tid)
+            if dead_tombstones:
+                logger.info("tombstones expired: %s", len(dead_tombstones))
+        if reclaimed:
+            logger.info("sweep complete: reclaimed=%s remaining=%s tombstones=%s",
+                        reclaimed, len(self._tasks), len(self._tombstones))
+        return reclaimed
 
     # ------------------------------------------------------------------
     # Per-caller worker + processors
@@ -262,9 +433,10 @@ class TaskExecutor:
                 quota.task_done()
                 return
             task.transition_to(TaskState.SCHEDULED)
+            await self._persist_locked(task)
             cancelled_early = task.cancel_event.is_set()
             if cancelled_early:
-                self._finalize_locked(
+                await self._finalize_locked(
                     task, TaskState.CANCELLED,
                     ErrorCode.SHUTTING_DOWN if self._shutting_down.is_set()
                     else ErrorCode.CANCELLED,
@@ -280,7 +452,7 @@ class TaskExecutor:
             if not granted:
                 # Cancel event fired while waiting for a concurrency slot.
                 async with self._lock:
-                    self._finalize_locked(
+                    await self._finalize_locked(
                         task, TaskState.CANCELLED,
                         ErrorCode.SHUTTING_DOWN if shutdown else ErrorCode.CANCELLED,
                         "cancelled while waiting for a slot")
@@ -289,22 +461,28 @@ class TaskExecutor:
                     self._terminal_cv.notify_all()
                 return
             async with self._lock:
+                if self._crashed:
+                    quota.task_done()
+                    return
                 if task.cancel_event.is_set():
-                    self._finalize_locked(
+                    await self._finalize_locked(
                         task, TaskState.CANCELLED,
                         ErrorCode.SHUTTING_DOWN if self._shutting_down.is_set()
                         else ErrorCode.CANCELLED,
                         "cancelled just after slot grant")
                 else:
                     task.transition_to(TaskState.RUNNING)
-                    task.attempt = 1
+                    # Recovered tasks keep their pre-restart attempt number.
+                    task.attempt = max(task.attempt, 1)
+                    await self._persist_locked(task)
             if task.state is TaskState.CANCELLED:
                 quota.task_done()
                 async with self._terminal_cv:
                     self._terminal_cv.notify_all()
                 return
             policy = self._config.retry_for(task.task_type)
-            logger.info("task running: task=%s attempt=1/%s", task_id, policy.max_attempts)
+            logger.info("task running: task=%s attempt=%s/%s",
+                        task_id, task.attempt, policy.max_attempts)
             await self._run_attempts(task, policy)
         quota.task_done()
 
@@ -314,6 +492,8 @@ class TaskExecutor:
     async def _run_attempts(self, task: TaskRecord, policy: Any) -> None:
         try:
             while True:
+                if self._crashed:
+                    return
                 handler = self._registry.get(task.task_type)
                 handler_task = asyncio.create_task(
                     handler(task.payload, task.cancel_event), name=f"handler-{task.task_id[:8]}"
@@ -326,8 +506,8 @@ class TaskExecutor:
                     code = (ErrorCode.SHUTTING_DOWN if self._shutting_down.is_set()
                             else ErrorCode.CANCELLED)
                     async with self._lock:
-                        self._finalize_locked(task, TaskState.CANCELLED, code,
-                                              "cancelled during execution")
+                        await self._finalize_locked(task, TaskState.CANCELLED, code,
+                                                    "cancelled during execution")
                     logger.info("task cancelled while running: task=%s code=%s",
                                 task.task_id, code)
                     return
@@ -341,17 +521,18 @@ class TaskExecutor:
                         exc.retryable, exhausted, exc.message)
                     if exhausted or not exc.retryable:
                         async with self._lock:
-                            self._finalize_locked(task, TaskState.FAILED,
-                                                  ErrorCode.HANDLER_FAILED, exc.message)
+                            await self._finalize_locked(task, TaskState.FAILED,
+                                                        ErrorCode.HANDLER_FAILED, exc.message)
                         return
                     async with self._lock:
                         task.transition_to(TaskState.RETRY_WAIT,
                                            error_code=ErrorCode.HANDLER_FAILED,
                                            error_message=exc.message)
+                        await self._persist_locked(task)
                     cancelled = await self._backoff(task, policy.delay_for(attempt_no + 1))
                     async with self._lock:
                         if cancelled:
-                            self._finalize_locked(
+                            await self._finalize_locked(
                                 task, TaskState.CANCELLED,
                                 ErrorCode.SHUTTING_DOWN if self._shutting_down.is_set()
                                 else ErrorCode.CANCELLED,
@@ -359,19 +540,20 @@ class TaskExecutor:
                             return
                         task.attempt += 1
                         task.transition_to(TaskState.RUNNING)
+                        await self._persist_locked(task)
                     logger.info("task retrying: task=%s attempt=%s",
                                 task.task_id, task.attempt)
                     continue
                 except Exception as exc:  # defensive: unexpected handler crash
                     logger.exception("unexpected handler error: task=%s", task.task_id)
                     async with self._lock:
-                        self._finalize_locked(task, TaskState.FAILED,
-                                              ErrorCode.HANDLER_FAILED, repr(exc))
+                        await self._finalize_locked(task, TaskState.FAILED,
+                                                    ErrorCode.HANDLER_FAILED, repr(exc))
                     return
                 else:
                     async with self._lock:
                         task.result = result
-                        self._finalize_locked(task, TaskState.SUCCEEDED)
+                        await self._finalize_locked(task, TaskState.SUCCEEDED)
                     logger.info("task succeeded: task=%s attempts=%s result=%s",
                                 task.task_id, task.attempt, result)
                     return
@@ -389,13 +571,15 @@ class TaskExecutor:
         except asyncio.TimeoutError:
             return False
 
-    def _finalize_locked(self, task: TaskRecord, state: TaskState,
-                         code: str | None = None, message: str | None = None) -> None:
+    async def _finalize_locked(self, task: TaskRecord, state: TaskState,
+                               code: str | None = None, message: str | None = None) -> None:
         try:
             task.transition_to(state, error_code=code, error_message=message)
         except IllegalTransition:
             logger.warning("redundant finalize ignored: task=%s already=%s target=%s",
                            task.task_id, task.state.value, state.value)
+            return
+        await self._persist_locked(task)
 
     # ------------------------------------------------------------------
     # Graceful shutdown
@@ -403,6 +587,8 @@ class TaskExecutor:
     async def shutdown(self) -> None:
         logger.info("shutdown initiated: rejecting new submissions")
         self._shutting_down.set()
+        if self._sweeper is not None:
+            self._sweeper.cancel()
 
         alive = [t for t in self._tasks.values() if not t.state.is_terminal]
         logger.info("shutdown: %s alive task(s); grace=%ss",
@@ -420,6 +606,7 @@ class TaskExecutor:
                     len(self._tasks),
                     sum(1 for t in self._tasks.values() if t.state.is_terminal),
                     len(remaining))
+        await self._persistence.close()
 
     async def _force_cancel_remaining(self) -> None:
         async with self._lock:
@@ -444,9 +631,9 @@ class TaskExecutor:
         async with self._lock:
             for task in self._tasks.values():
                 if not task.state.is_terminal:
-                    self._finalize_locked(task, TaskState.CANCELLED,
-                                          ErrorCode.SHUTTING_DOWN,
-                                          "force-finalized after shutdown timeout")
+                    await self._finalize_locked(task, TaskState.CANCELLED,
+                                                ErrorCode.SHUTTING_DOWN,
+                                                "force-finalized after shutdown timeout")
             self._terminal_cv.notify_all()
 
     async def _await_all_terminal(self) -> None:
@@ -454,6 +641,31 @@ class TaskExecutor:
             await self._terminal_cv.wait_for(
                 lambda: all(t.state.is_terminal for t in self._tasks.values())
             )
+
+    # ------------------------------------------------------------------
+    # Crash simulation (test-only)
+    # ------------------------------------------------------------------
+    def simulate_crash(self) -> None:
+        """Freeze this executor as if the process had died abruptly.
+
+        All in-flight coroutines are unwound and - crucially - no further
+        state mutation is persisted, so the durable journal keeps exactly
+        what a real crash would have left behind.  A new executor built on
+        the same persistence path then observes the pre-crash state.
+        """
+        self._crashed = True
+        self._shutting_down.set()
+        if self._sweeper is not None:
+            self._sweeper.cancel()
+        for task in self._tasks.values():
+            if not task.state.is_terminal:
+                task.cancel_event.set()
+        for worker in self._workers.values():
+            worker.cancel()
+        for handler_task in self._handler_tasks.values():
+            handler_task.cancel()
+        logger.warning("crash simulated: %s task(s) left non-terminal in journal",
+                       sum(1 for t in self._tasks.values() if not t.state.is_terminal))
 
     async def _join_workers(self, timeout: float = _FORCE_CANCEL_WAIT) -> None:
         """Cancel per-caller workers and bound the wait.

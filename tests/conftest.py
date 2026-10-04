@@ -34,6 +34,10 @@ def make_executor():
         idempotency_ttl: float = 300.0,
         shutdown_grace: float = 5.0,
         quotas: dict[str, QuotaConfig] | None = None,
+        persistence_path: str | None = None,
+        history_retention: float = 3600.0,
+        retention_sweep_interval: float = 60.0,
+        tombstone_retention: float = 86400.0,
     ) -> TaskExecutor:
         cfg = GatewayConfig(
             idempotency_ttl=idempotency_ttl,
@@ -50,12 +54,21 @@ def make_executor():
                 queue_capacity=queue_capacity,
             ),
             quotas=quotas or {},
+            persistence_path=persistence_path,
+            history_retention=history_retention,
+            retention_sweep_interval=retention_sweep_interval,
+            tombstone_retention=tombstone_retention,
         )
+        persistence = None
+        if persistence_path is not None:
+            from gateway.persistence import SqlitePersistence
+            persistence = SqlitePersistence(persistence_path)
         executor = TaskExecutor(
             config=cfg,
             quota_manager=QuotaManager(cfg.default_quota, cfg.quotas),
-            idempotency_store=IdempotencyStore(idempotency_ttl),
+            idempotency_store=IdempotencyStore(idempotency_ttl, persistence=persistence),
             registry=build_default_registry(),
+            persistence=persistence,
         )
         started.append(executor)
         return executor
